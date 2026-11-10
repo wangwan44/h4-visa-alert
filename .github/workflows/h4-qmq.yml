@@ -1,0 +1,112 @@
+name: H4 QMQ Visa Slot Alert
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'check (regular alert) or test-push (notification test)'
+        type: choice
+        options:
+          - check
+          - test-push
+        default: check
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: read
+
+env:
+  VISA_CITIES: '北京,武汉,上海,广州,沈阳'
+  VISA_TYPE: 'H-4'
+  VISA_CUTOFF: '2026-12-22'
+  VISA_INCLUDE_EMERGENCY: '0'
+  VISA_PUSH_REPEAT: '1'
+  VISA_NTFY_TOPIC: ${{ secrets.VISA_NTFY_TOPIC }}
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Respect Austin quiet hours (00:00 to 07:00)
+        id: hours
+        shell: bash
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          local = datetime.now(ZoneInfo('America/Chicago'))
+          print(f"hour={local.hour:02d}")
+          print(f"active={'true' if 7 <= local.hour < 24 else 'false'}")
+          print(f"local_time={local.isoformat()}")
+          PY
+      - name: Explain quiet-hours skip
+        if: steps.hours.outputs.active != 'true' && github.event_name == 'schedule'
+        run: echo 'Skipped; Austin quiet hours 00:00-07:00.'
+      - name: Retrieve the public QMQ monitor source
+        if: steps.hours.outputs.active == 'true' || github.event_name == 'workflow_dispatch'
+        run: git clone --depth 1 https://github.com/se7en1een/visaMonitor.git upstream
+      - name: Set up Python
+        if: steps.hours.outputs.active == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        if: steps.hours.outputs.active == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          pip install -r upstream/requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Restore prior alert state
+        if: steps.hours.outputs.active == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/cache/restore@v4
+        with:
+          path: .monitor-state/state.json
+          key: visa-h4-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            visa-h4-state-
+      - name: Check QMQ and filter exact date range
+        if: steps.hours.outputs.active == 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          MODE: ${{ inputs.mode }}
+          VISA_STATE: ${{ github.workspace }}/.monitor-state/state.json
+          VISA_HISTORY: ${{ runner.temp }}/visa-h4-history.jsonl
+        shell: bash
+        run: |
+          mkdir -p .monitor-state
+          python - <<'PY'
+          import os, sys
+          from datetime import date
+          from pathlib import Path
+          sys.path.insert(0, str(Path('upstream').resolve()))
+          import monitor
+
+          if not os.environ.get('VISA_NTFY_TOPIC'):
+              raise SystemExit('ERROR: add the VISA_NTFY_TOPIC Actions secret first')
+          if os.environ.get('MODE') == 'test-push':
+              monitor.push('H4 QMQ test', 'GitHub Actions to ntfy works. Not a real visa slot.', priority='default')
+              raise SystemExit(0)
+
+          first = date(2026, 12, 15)
+          last = date(2026, 12, 22)
+          original_find_matches = monitor.find_matches
+          def exact_window(data, today, cutoff):
+              results = original_find_matches(data, today, cutoff)
+              output = []
+              for match in results:
+                  dates = [d for d in match.get('dates', []) if first <= date.fromisoformat(d) <= last]
+                  if dates:
+                      copy = dict(match)
+                      copy['dates'] = dates
+                      output.append(copy)
+              return output
+          monitor.find_matches = exact_window
+          monitor.run_once()
+          PY
+      - name: Save alert state for next check
+        if: (steps.hours.outputs.active == 'true' || github.event_name == 'workflow_dispatch') && success()
+        uses: actions/cache/save@v4
+        with:
+          path: .monitor-state/state.json
+          key: visa-h4-state-${{ github.run_id }}-${{ github.run_attempt }}
